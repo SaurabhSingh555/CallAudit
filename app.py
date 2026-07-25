@@ -536,6 +536,21 @@ def fmt_hms(total_seconds):
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
 
+def bump_ui_version():
+    """Force every version-scoped widget to re-initialize from the latest
+    session_state / DB values on the next rerun. Call this right before
+    st.rerun() after ANY save/apply/reset action so the UI never shows
+    stale values."""
+    st.session_state["ui_version"] = st.session_state.get("ui_version", 0) + 1
+
+def vkey(name: str) -> str:
+    """Build a widget key that changes whenever bump_ui_version() has been
+    called. Streamlit ignores a widget's `value`/`default` param once a
+    key already has state - suffixing the key with the current ui_version
+    forces the widget to rebuild from the fresh value instead of showing
+    a stale cached one."""
+    return f"{name}__v{st.session_state.get('ui_version', 0)}"
+
 # ----------------------------------------------------------------------
 # CRM + Groq configuration
 # ----------------------------------------------------------------------
@@ -779,19 +794,7 @@ def filter_out_vdcl_calls(df):
 # Get duration config from clients table
 # ----------------------------------------------------------------------
 def get_duration_config(client_name):
-    clients = st.session_state.get("clients", {})
-    if client_name in clients:
-        data = clients[client_name]
-        if isinstance(data, dict):
-            return {
-                "short_max": data.get("short_max", 120),
-                "medium_min": data.get("medium_min", 120),
-                "medium_max": data.get("medium_max", 300),
-                "large_min": data.get("large_min", 300),
-                "extra_large_enabled": data.get("extra_large_enabled", False),
-                "extra_large_min": data.get("extra_large_min", 480),
-            }
-    return {
+    base = {
         "short_max": 120,
         "medium_min": 120,
         "medium_max": 300,
@@ -799,6 +802,28 @@ def get_duration_config(client_name):
         "extra_large_enabled": False,
         "extra_large_min": 480,
     }
+    clients = st.session_state.get("clients", {})
+    if client_name in clients:
+        data = clients[client_name]
+        if isinstance(data, dict):
+            base = {
+                "short_max": data.get("short_max", base["short_max"]),
+                "medium_min": data.get("medium_min", base["medium_min"]),
+                "medium_max": data.get("medium_max", base["medium_max"]),
+                "large_min": data.get("large_min", base["large_min"]),
+                "extra_large_enabled": data.get("extra_large_enabled", base["extra_large_enabled"]),
+                "extra_large_min": data.get("extra_large_min", base["extra_large_min"]),
+            }
+    # IMPORTANT: session-only overrides set via the "✅ Apply" button in
+    # Step 2 of the dashboard must win over the saved DB config for the
+    # current browser session. Previously this dict was written to but
+    # never read anywhere, so "Apply" appeared to work but silently had
+    # zero effect on buckets, labels, agent analytics, or defaulter
+    # detection. This merge is what makes Apply/Reset actually flexible.
+    overrides = st.session_state.get("duration_overrides", {})
+    if client_name in overrides:
+        base.update(overrides[client_name])
+    return base
 
 # ----------------------------------------------------------------------
 # Agent analytics
@@ -1966,13 +1991,13 @@ def render_dashboard():
             short_cutoff_min = st.number_input(
                 "Short ends at (minutes)", min_value=0.5, max_value=15.0,
                 value=round(duration_config['short_max'] / 60, 2), step=0.5,
-                key=f"short_cutoff_{client_name}",
+                key=vkey(f"short_cutoff_{client_name}"),
             )
         with oc2:
             large_cutoff_min = st.number_input(
                 "Large starts after (minutes)", min_value=short_cutoff_min, max_value=30.0,
                 value=max(round(duration_config['large_min'] / 60, 2), short_cutoff_min), step=0.5,
-                key=f"large_cutoff_{client_name}",
+                key=vkey(f"large_cutoff_{client_name}"),
             )
         with oc3:
             st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
@@ -1982,13 +2007,14 @@ def render_dashboard():
             with bcol2:
                 if st.button("↩️ Reset", key="reset_overrides", use_container_width=True):
                     st.session_state["duration_overrides"].pop(client_name, None)
+                    bump_ui_version()
                     st.success("↩️ Reset to default.")
                     st.rerun()
 
         st.markdown("---")
         enable_xl = st.checkbox(
             "➕ Also split out an 'Extra Large' bucket (e.g. calls over 8 min)",
-            value=duration_config.get('extra_large_enabled', False), key=f"enable_xl_{client_name}",
+            value=duration_config.get('extra_large_enabled', False), key=vkey(f"enable_xl_{client_name}"),
         )
         xl_cutoff_min = None
         if enable_xl:
@@ -1996,7 +2022,7 @@ def render_dashboard():
             xl_cutoff_min = st.number_input(
                 "Extra Large starts after (minutes)", min_value=large_cutoff_min, max_value=60.0,
                 value=max(round(default_xl / 60, 2), large_cutoff_min + 0.5), step=0.5,
-                key=f"xl_cutoff_{client_name}",
+                key=vkey(f"xl_cutoff_{client_name}"),
             )
         if apply_clicked:
             override = {
@@ -2009,6 +2035,7 @@ def render_dashboard():
             if enable_xl and xl_cutoff_min:
                 override["extra_large_min"] = int(round(xl_cutoff_min * 60))
             st.session_state["duration_overrides"][client_name] = override
+            bump_ui_version()
             st.success("✅ Applied for this session!")
             st.rerun()
 
@@ -2322,12 +2349,12 @@ def render_dashboard():
         silence_threshold = st.number_input(
             "Silence threshold (%)", min_value=20, max_value=50, value=st.session_state.get("silence_threshold", 30), step=5,
             help="Agents with overall OR short-call silence above this are flagged.",
-            key="complete_silence_threshold"
+            key=vkey("complete_silence_threshold")
         )
     with cfg_col2:
         min_calls_per_agent = st.number_input(
             "Minimum calls per agent", min_value=1, max_value=10, value=st.session_state.get("min_calls_per_agent", 3), step=1,
-            help="Agents with fewer calls are skipped.", key="complete_min_calls"
+            help="Agents with fewer calls are skipped.", key=vkey("complete_min_calls")
         )
     with cfg_col3:
         st.markdown("<br>", unsafe_allow_html=True)
@@ -2443,6 +2470,14 @@ def render_settings():
         <p>Manage clients, email recipients, and system configuration.</p>
     </div>
     """, unsafe_allow_html=True)
+
+    top_l, top_r = st.columns([4, 1])
+    with top_r:
+        if st.button("🔄 Refresh from DB", key="settings_refresh_all", use_container_width=True):
+            load_all_configs()
+            bump_ui_version()
+            st.success("Synced with database.")
+            st.rerun()
     
     # Create tabs for settings
     tab1, tab2, tab3, tab4 = st.tabs([
@@ -2510,6 +2545,7 @@ def render_settings():
                 if save_client_to_db(new_client_name, new_company_id, config):
                     st.success(f"✅ Client '{new_client_name}' added successfully!")
                     load_all_configs()
+                    bump_ui_version()
                     st.rerun()
                 else:
                     st.error("❌ Failed to add client. Check Supabase connection.")
@@ -2524,6 +2560,7 @@ def render_settings():
                 if delete_client_from_db(remove_client):
                     st.success(f"✅ Client '{remove_client}' removed successfully!")
                     load_all_configs()
+                    bump_ui_version()
                     st.rerun()
                 else:
                     st.error("❌ Failed to remove client.")
@@ -2541,13 +2578,13 @@ def render_settings():
         
         col1, col2 = st.columns(2)
         with col1:
-            smtp_host = st.text_input("SMTP Server", value=smtp_config.get("host", "mail.dialdesk.net"), key="settings_smtp_host")
-            smtp_port = st.number_input("Port", value=int(smtp_config.get("port", 587)), step=1, key="settings_smtp_port")
-            smtp_username = st.text_input("Username", value=smtp_config.get("username", ""), key="settings_smtp_username")
+            smtp_host = st.text_input("SMTP Server", value=smtp_config.get("host", "mail.dialdesk.net"), key=vkey("settings_smtp_host"))
+            smtp_port = st.number_input("Port", value=int(smtp_config.get("port", 587)), step=1, key=vkey("settings_smtp_port"))
+            smtp_username = st.text_input("Username", value=smtp_config.get("username", ""), key=vkey("settings_smtp_username"))
         with col2:
-            smtp_password = st.text_input("Password", value=smtp_config.get("password", ""), type="password", key="settings_smtp_password")
-            smtp_from = st.text_input("From Email", value=smtp_config.get("from_email", ""), key="settings_smtp_from")
-            smtp_tls = st.checkbox("Use TLS", value=smtp_config.get("use_tls", True), key="settings_smtp_tls")
+            smtp_password = st.text_input("Password", value=smtp_config.get("password", ""), type="password", key=vkey("settings_smtp_password"))
+            smtp_from = st.text_input("From Email", value=smtp_config.get("from_email", ""), key=vkey("settings_smtp_from"))
+            smtp_tls = st.checkbox("Use TLS", value=smtp_config.get("use_tls", True), key=vkey("settings_smtp_tls"))
         
         col_btn1, col_btn2 = st.columns(2)
         with col_btn1:
@@ -2563,6 +2600,7 @@ def render_settings():
                 if save_smtp_config_to_db(updated_config):
                     st.success("✅ SMTP settings saved!")
                     load_all_configs()
+                    bump_ui_version()
                     st.rerun()
                 else:
                     st.error("❌ Failed to save SMTP settings.")
@@ -2600,6 +2638,7 @@ def render_settings():
                     if save_mentor_emails_to_db(emails):
                         st.success(f"✅ Added {new_email.strip()}")
                         load_all_configs()
+                        bump_ui_version()
                         st.rerun()
                     else:
                         st.error("❌ Failed to save email.")
@@ -2609,7 +2648,7 @@ def render_settings():
         if current_emails:
             col1, col2 = st.columns([2, 1])
             with col1:
-                remove_email = st.selectbox("Remove recipient", [""] + current_emails, key="settings_remove_select")
+                remove_email = st.selectbox("Remove recipient", [""] + current_emails, key=vkey("settings_remove_select"))
             with col2:
                 st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
                 if st.button("🗑️ Remove", use_container_width=True, key="settings_remove_email"):
@@ -2618,6 +2657,7 @@ def render_settings():
                         if save_mentor_emails_to_db(emails):
                             st.success(f"✅ Removed {remove_email}")
                             load_all_configs()
+                            bump_ui_version()
                             st.rerun()
                         else:
                             st.error("❌ Failed to remove email.")
@@ -2638,21 +2678,27 @@ def render_settings():
                 "Select clients for auto-reporting",
                 options=all_clients,
                 default=valid_auto_clients if valid_auto_clients else [],
-                key="settings_auto_clients"
+                key=vkey("settings_auto_clients")
             )
             
             if st.button("💾 Save Auto-Schedule Clients", key="save_auto_clients"):
-                if supabase:
-                    try:
-                        supabase.table("scheduler_config").update({
-                            "auto_schedule_clients": selected_auto
-                        }).eq("id", 1).execute()
-                        st.session_state["auto_schedule_clients"] = selected_auto
-                        st.success("✅ Auto-schedule clients updated!")
-                    except Exception as e:
-                        st.error(f"❌ Failed to update: {e}")
+                # Merge with the existing scheduler_time / scheduler_enabled so we
+                # never overwrite them, and use the same upsert-safe helper used
+                # everywhere else (no hard-coded row id, so it always saves
+                # correctly whether or not a scheduler_config row exists yet).
+                config = {
+                    "scheduler_time": st.session_state.get("scheduler_time", "23:00"),
+                    "scheduler_enabled": st.session_state.get("scheduler_enabled", True),
+                    "auto_schedule_clients": selected_auto,
+                }
+                if save_scheduler_config_to_db(config):
+                    st.session_state["auto_schedule_clients"] = selected_auto
+                    st.success("✅ Auto-schedule clients updated!")
+                    load_all_configs()
+                    bump_ui_version()
+                    st.rerun()
                 else:
-                    st.warning("Supabase not connected. Changes won't be saved.")
+                    st.error("❌ Failed to update. Check Supabase connection.")
         else:
             st.info("Add clients first to configure auto-scheduling.")
     
@@ -2668,9 +2714,9 @@ def render_settings():
         
         col1, col2 = st.columns(2)
         with col1:
-            new_scheduler_time = st.text_input("Report Time (HH:MM)", value=current_time, key="settings_scheduler_time")
+            new_scheduler_time = st.text_input("Report Time (HH:MM)", value=current_time, key=vkey("settings_scheduler_time"))
         with col2:
-            scheduler_enabled = st.checkbox("Enable Auto-Scheduler", value=current_enabled, key="settings_scheduler_enabled")
+            scheduler_enabled = st.checkbox("Enable Auto-Scheduler", value=current_enabled, key=vkey("settings_scheduler_enabled"))
         
         if st.button("💾 Save Scheduler Settings", key="save_scheduler_settings"):
             try:
@@ -2678,11 +2724,13 @@ def render_settings():
                 config = {
                     "scheduler_time": new_scheduler_time,
                     "scheduler_enabled": scheduler_enabled,
+                    "auto_schedule_clients": st.session_state.get("auto_schedule_clients", []),
                 }
                 if save_scheduler_config_to_db(config):
                     st.session_state["scheduler_time"] = new_scheduler_time
                     st.session_state["scheduler_enabled"] = scheduler_enabled
                     restart_scheduler()
+                    bump_ui_version()
                     st.success(f"✅ Scheduler updated! Reports will run daily at {new_scheduler_time}")
                     st.rerun()
                 else:
@@ -2725,7 +2773,7 @@ def render_settings():
                 min_value=20, max_value=50, 
                 value=current_silence, step=5,
                 help="Agents with overall or short-call silence above this are flagged.",
-                key="settings_silence_threshold"
+                key=vkey("settings_silence_threshold")
             )
         with col2:
             new_min_calls = st.number_input(
@@ -2733,7 +2781,7 @@ def render_settings():
                 min_value=1, max_value=10,
                 value=current_min_calls, step=1,
                 help="Agents with fewer calls are skipped from defaulter detection.",
-                key="settings_min_calls"
+                key=vkey("settings_min_calls")
             )
         
         if st.button("💾 Save Defaulter Settings", key="save_defaulter_settings"):
@@ -2744,6 +2792,7 @@ def render_settings():
             if save_defaulters_config_to_db(config):
                 st.session_state["silence_threshold"] = new_silence_threshold
                 st.session_state["min_calls_per_agent"] = new_min_calls
+                bump_ui_version()
                 st.success("✅ Defaulter settings saved!")
                 st.rerun()
             else:
